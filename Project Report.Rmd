@@ -1,0 +1,469 @@
+---
+title: "Is Bitcoin Closer to Wall Street or Gold Bars? A Correlation Study with QQQ and GLD"
+author: "Yang Wonjun (3035666774)"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: readable
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,       # show code by default
+  message = FALSE,   # hide most messages
+  warning = FALSE    # hide warnings in knitted HTML
+)
+```
+
+```{r}
+# Load required packages
+library(quantmod)    # download financial data
+library(dplyr)       # data manipulation
+library(tidyr)       # reshaping data
+library(ggplot2)     # plotting
+library(zoo)         # rolling calculations
+library(knitr)       # nicely formatted tables
+```
+
+# 1. Introduction
+
+Bitcoin is sometimes called “digital gold”, but it also behaves like a speculative tech asset that swings widely with market sentiment. For investors, a simple but important question is: does Bitcoin move more like a tech stock index such as the Nasdaq-100, or more like gold?
+
+If Bitcoin behaves more like a tech-heavy equity index (tracked by the ETF QQQ), then holding Bitcoin may amplify stock market risk and provide limited diversification during crashes. If instead it behaves more like gold (tracked by the ETF GLD), then Bitcoin might play a partial safe-haven role when equities fall.
+
+In this project, I study daily market data from 2020 to 2024. This period includes the COVID-19 crash, the 2021 crypto boom and the later tightening cycle. I compare Bitcoin (BTC-USD) with QQQ and GLD to see how closely their returns move together over time.
+
+The main questions are:
+
+1. From 2020–2024, has Bitcoin’s daily return behaviour been closer to QQQ or to GLD?  
+2. How have the correlations between Bitcoin, QQQ and GLD changed over time, especially around major market events?
+
+To answer these questions, I work with daily log returns and use summary statistics, full-sample correlations, rolling (moving-window) correlations and simple visualisations in R.
+
+# 2. Data
+
+## 2.1 Data sources and period
+
+The data come from Yahoo Finance, which provides historical price data for:
+
+- Bitcoin in USD: `BTC-USD`  
+- Nasdaq-100 ETF: `QQQ`  
+- Gold ETF: `GLD`  
+
+I use daily **adjusted closing prices** from 2020-01-01 to 2024-12-31. Adjusted prices account for splits and dividends, so they are suitable for return calculations. I keep only the dates where all three assets have valid prices, which automatically removes weekends and holidays and aligns them on common trading days.
+
+```{r}
+# Date range to study
+start_date <- "2020-01-01"
+end_date   <- "2024-12-31"
+
+# Download each series from Yahoo Finance (auto.assign = FALSE returns an object directly)
+btc_xts <- getSymbols("BTC-USD", src = "yahoo",
+                      from = start_date, to = end_date,
+                      auto.assign = FALSE)
+
+qqq_xts <- getSymbols("QQQ", src = "yahoo",
+                      from = start_date, to = end_date,
+                      auto.assign = FALSE)
+
+gld_xts <- getSymbols("GLD", src = "yahoo",
+                      from = start_date, to = end_date,
+                      auto.assign = FALSE)
+
+# Build data frames with a Date column and adjusted close price
+btc_df <- data.frame(
+  date = index(btc_xts),
+  BTC  = as.numeric(Ad(btc_xts))
+)
+
+qqq_df <- data.frame(
+  date = index(qqq_xts),
+  QQQ  = as.numeric(Ad(qqq_xts))
+)
+
+gld_df <- data.frame(
+  date = index(gld_xts),
+  GLD  = as.numeric(Ad(gld_xts))
+)
+
+# Join on dates where all three assets have data
+prices_df <- btc_df |>
+  inner_join(qqq_df, by = "date") |>
+  inner_join(gld_df, by = "date") |>
+  arrange(date)
+
+# Basic checks
+head(prices_df)
+nrow(prices_df)
+summary(prices_df)
+
+# Save merged prices to CSV
+write.csv(prices_df, "crypto_traditional_prices_2020_2024.csv", row.names = FALSE)
+```
+
+## 2.2 Price evolution
+
+To compare price paths on the same scale, I rescale each series so that its value is 1 at the start of 2020 and then plot these indexed prices over time. This answers the question: “If I invested 1 unit in each asset at the beginning of 2020, how would it have grown?”
+
+```{r}
+# Create indexed prices (start of sample = 1)
+prices_indexed <- prices_df |>
+  mutate(
+    BTC = BTC / dplyr::first(BTC),
+    QQQ = QQQ / dplyr::first(QQQ),
+    GLD = GLD / dplyr::first(GLD)
+  ) |>
+  select(date, BTC, QQQ, GLD) |>
+  pivot_longer(-date, names_to = "asset", values_to = "index_value") |>
+  mutate(
+    asset = factor(asset, levels = c("BTC", "QQQ", "GLD"))  # legend order
+  )
+
+# Plot indexed prices over time
+ggplot(prices_indexed, aes(x = date, y = index_value, colour = asset)) +
+  geom_line() +
+  labs(
+    title = "Indexed Prices (start of 2020 = 1)",
+    x = "Date",
+    y = "Index value",
+    colour = "Asset"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)  # center title
+  )
+```
+
+In this plot, Bitcoin’s line usually swings much more than QQQ and GLD. It rises sharply during bull phases and drops steeply during sell-offs. QQQ moves in a smoother way, while GLD tends to move in a narrower band. This already hints that Bitcoin is both riskier and more “boom-and-bust” than the two traditional assets.
+
+# 3. Methods
+
+To make the assets comparable, I work with daily log returns rather than raw prices. For each asset, the log return on day \(t\) is
+
+\[
+\text{log return}_t = \log \left( \frac{\text{Price}_t}{\text{Price}_{t-1}} \right).
+\]
+
+Log returns handle different price levels naturally and can be added over time.
+
+After converting prices to returns, I use three main tools:
+
+1. **Summary statistics**: mean, volatility (standard deviation), and the minimum and maximum daily returns for each asset.  
+2. **Full-sample Pearson correlations** of daily returns between each pair of assets (BTC–QQQ, BTC–GLD, QQQ–GLD).  
+3. **Rolling (moving-window) correlations**, using a 60-day window, to see how co-movement changes over time.
+
+The goal is not to build a complex trading model, but to get a clear, interpretable picture of how Bitcoin, QQQ and GLD have moved together from 2020 to 2024.
+
+## 3.1 Computing daily returns
+
+```{r}
+# Compute daily log returns for each asset
+returns_df <- prices_df |>
+  arrange(date) |>
+  mutate(
+    ret_btc = log(BTC / lag(BTC)),
+    ret_qqq = log(QQQ / lag(QQQ)),
+    ret_gld = log(GLD / lag(GLD))
+  ) |>
+  tidyr::drop_na()  # remove first row with NA returns
+
+# Quick check of the returns data
+head(returns_df)
+summary(returns_df[, c("ret_btc", "ret_qqq", "ret_gld")])
+```
+
+I focus on the three return columns `ret_btc`, `ret_qqq` and `ret_gld` in the analysis.
+
+# 4. Results
+
+## 4.1 Summary statistics of daily returns
+
+First, I look at basic statistics to compare average daily returns and riskiness (volatility).
+
+```{r}
+# Reshape returns into long format for easier grouping
+returns_long <- returns_df |>
+  select(date, ret_btc, ret_qqq, ret_gld) |>
+  pivot_longer(-date, names_to = "asset", values_to = "return") |>
+  mutate(
+    asset = dplyr::recode(
+      asset,
+      "ret_btc" = "BTC",
+      "ret_qqq" = "QQQ",
+      "ret_gld" = "GLD"
+    ),
+    # set desired order: BTC, QQQ, GLD
+    asset = factor(asset, levels = c("BTC", "QQQ", "GLD"))
+  )
+
+# Compute summary statistics by asset
+summary_stats <- returns_long |>
+  group_by(asset) |>
+  summarise(
+    n    = n(),
+    mean = mean(return),
+    sd   = sd(return),
+    min  = min(return),
+    max  = max(return),
+    .groups = "drop"
+  ) |>
+  arrange(asset)  # ensure the table prints in factor order
+
+# Display the summary table
+kable(
+  summary_stats,
+  digits  = 4,
+  caption = "Summary statistics of daily log returns (2020–2024)"
+)
+```
+
+This table allows me to compare:
+
+- which asset has the highest **volatility** (standard deviation),  
+- which has the highest **average daily return**, and  
+- how extreme the minimum and maximum daily moves are.
+
+In this sample, Bitcoin clearly has the highest volatility and the largest positive and negative daily returns. QQQ is less volatile than Bitcoin but riskier than GLD, while GLD is the most stable of the three.
+
+### Boxplot of daily returns
+
+To summarise the distributions visually, I add a boxplot of daily returns.
+
+```{r}
+# Ensure the x-axis order is BTC, QQQ, GLD
+returns_long <- returns_long |>
+  mutate(asset = factor(asset, levels = c("BTC", "QQQ", "GLD")))
+
+# Boxplot of daily log returns by asset
+ggplot(returns_long, aes(x = asset, y = return, fill = asset)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(
+    title = "Boxplot of daily log returns (2020–2024)",
+    x = "Asset",
+    y = "Daily log return"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5)  # center title
+  )
+```
+
+The boxplot shows that Bitcoin’s box is much taller with longer whiskers, confirming its higher volatility and more extreme daily moves compared with QQQ and especially GLD.
+
+## 4.2 Distribution of returns
+
+Next, I compare the distributions of daily returns using histograms.
+
+```{r}
+# Ensure facet order is BTC, QQQ, GLD
+returns_long <- returns_long |>
+  mutate(asset = factor(asset, levels = c("BTC", "QQQ", "GLD")))
+
+# Plot histograms of daily returns for each asset
+ggplot(returns_long, aes(x = return)) +
+  geom_histogram(bins = 60) +
+  facet_wrap(~ asset, scales = "free_y") +
+  labs(
+    title = "Histogram of daily log returns",
+    x = "Daily log return",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)  # center title
+  )
+```
+
+Bitcoin’s histogram is much wider and has fatter tails than those of QQQ and GLD, meaning that large positive and negative moves happen more often. QQQ’s distribution is narrower but still shows noticeable swings. GLD’s returns are more concentrated around zero, consistent with its reputation as a relatively stable asset.
+
+## 4.3 Full-sample correlations
+
+I now examine Pearson correlations of daily returns over the whole period.
+
+```{r}
+# Compute the correlation matrix for daily returns
+corr_matrix <- cor(returns_df[, c("ret_btc", "ret_qqq", "ret_gld")])
+
+# Rename rows and columns to cleaner labels
+colnames(corr_matrix) <- c("BTC", "QQQ", "GLD")
+rownames(corr_matrix) <- c("BTC", "QQQ", "GLD")
+
+# Display the correlation matrix
+kable(corr_matrix, digits = 3,
+      caption = "Correlation matrix of daily log returns (2020–2024)")
+```
+
+The matrix summarises how often each pair of assets tends to move in the same direction on a given day. In my sample, Bitcoin has a clear positive correlation with QQQ, while its correlation with GLD is weaker and closer to zero. QQQ and GLD also show a positive but relatively modest correlation.
+
+Overall, this suggests that, over 2020–2024, Bitcoin has moved more like a risky equity-linked asset than like gold.
+
+### Correlation heatmap
+
+To make the correlations easier to see, I plot them as a heatmap.
+
+```{r}
+# Convert correlation matrix to a tidy data frame for plotting
+corr_df <- as.data.frame(corr_matrix)
+corr_df$asset1 <- rownames(corr_df)
+
+corr_df <- corr_df |>
+  pivot_longer(
+    cols = c("BTC", "QQQ", "GLD"),
+    names_to = "asset2",
+    values_to = "correlation"
+  ) |>
+  mutate(
+    # x-axis: left to right BTC, QQQ, GLD
+    asset1 = factor(asset1, levels = c("BTC", "QQQ", "GLD")),
+    # y-axis: reversed order so the 1s lie on the opposite diagonal
+    asset2 = factor(asset2, levels = c("GLD", "QQQ", "BTC"))
+  )
+
+# Heatmap of correlation matrix with labels
+ggplot(corr_df, aes(x = asset1, y = asset2, fill = correlation)) +
+  geom_tile() +
+  geom_text(aes(label = round(correlation, 2))) +
+  scale_fill_gradient2(
+    limits = c(-1, 1),
+    breaks = seq(-1, 1, by = 0.5)
+  ) +
+  labs(
+    title = "Correlation matrix of daily log returns (2020–2024)",
+    x = "",
+    y = "",
+    fill = "Correlation"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)  # center the title
+  )
+```
+
+The heatmap highlights that the strongest co-movement in this sample is between BTC and QQQ, while the cells involving GLD are less intense. Visually, this reinforces the idea that Bitcoin’s daily movements are more closely aligned with QQQ than with GLD.
+
+## 4.4 Rolling 60-day correlations
+
+Financial relationships are rarely constant. To see how co-movement changes over time, I compute rolling correlations over a 60-day window.
+
+```{r}
+# Convert returns to a zoo object for rolling calculations
+ret_zoo <- zoo(
+  returns_df[, c("ret_btc", "ret_qqq", "ret_gld")],
+  order.by = returns_df$date
+)
+
+window_size <- 60  # 60 trading days ~ 3 months
+
+# Rolling correlation between BTC and QQQ
+roll_cor_btc_qqq <- rollapply(
+  ret_zoo[, c("ret_btc", "ret_qqq")],
+  width  = window_size,
+  FUN    = function(x) cor(x[, 1], x[, 2]),
+  by.column = FALSE,
+  align  = "right",
+  fill   = NA
+)
+
+# Rolling correlation between BTC and GLD
+roll_cor_btc_gld <- rollapply(
+  ret_zoo[, c("ret_btc", "ret_gld")],
+  width  = window_size,
+  FUN    = function(x) cor(x[, 1], x[, 2]),
+  by.column = FALSE,
+  align  = "right",
+  fill   = NA
+)
+
+# Combine rolling correlations into a tidy data frame for plotting
+roll_df <- data.frame(
+  date          = index(roll_cor_btc_qqq),
+  cor_btc_qqq   = as.numeric(roll_cor_btc_qqq),
+  cor_btc_gld   = as.numeric(roll_cor_btc_gld)
+) |>
+  tidyr::pivot_longer(
+    cols      = c(cor_btc_qqq, cor_btc_gld),
+    names_to  = "pair",
+    values_to = "correlation"
+  ) |>
+  dplyr::mutate(
+    pair = dplyr::recode(
+      pair,
+      "cor_btc_qqq" = "BTC vs QQQ",
+      "cor_btc_gld" = "BTC vs GLD"
+    ),
+    # legend order: BTC vs QQQ, then BTC vs GLD
+    pair = factor(pair, levels = c("BTC vs QQQ", "BTC vs GLD"))
+  )
+
+# Plot rolling correlations over time
+ggplot(roll_df, aes(x = date, y = correlation, colour = pair)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line() +
+  labs(
+    title  = "Rolling 60-day correlations of daily returns",
+    x      = "Date",
+    y      = "Correlation",
+    colour = "Pair"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)  # center title
+  )
+```
+
+The rolling correlations move up and down over time. The BTC vs QQQ correlation often stays above the BTC vs GLD correlation, especially during some market phases, but there are also periods when both correlations drop closer to zero. This time-varying pattern shows that Bitcoin’s role in a portfolio is not fixed: sometimes it moves strongly with equities, and at other times the link weakens.
+
+## 4.5 Sub-period comparison
+
+I can split the sample into years and compare correlations by year.
+
+```{r}
+# Add a year column to the returns data
+returns_df_year <- returns_df |>
+  mutate(
+    year = format(date, "%Y")
+  )
+
+# Compute yearly correlations between BTC and QQQ/GLD
+sub_corrs <- returns_df_year |>
+  group_by(year) |>
+  summarise(
+    cor_btc_qqq = cor(ret_btc, ret_qqq),
+    cor_btc_gld = cor(ret_btc, ret_gld),
+    .groups = "drop"
+  )
+
+kable(sub_corrs, digits = 3,
+      caption = "Yearly correlations between Bitcoin and QQQ/GLD")
+```
+
+This table can reveal whether certain years (for example, 2020 vs 2022) show stronger or weaker relationships between Bitcoin and the traditional assets.
+
+# 5. Discussion and Conclusion
+
+This project set out to answer whether Bitcoin behaves more like a tech stock or “digital gold”, using daily return data for Bitcoin, QQQ and GLD from 2020 to 2024.
+
+The results point in a consistent direction:
+
+- Bitcoin is by far the most volatile asset in the sample, with much larger day-to-day swings than QQQ and especially GLD.  
+- Bitcoin’s daily returns show a clear positive correlation with QQQ, while its correlation with GLD is weaker and closer to zero.  
+- Rolling correlations reveal that these relationships are time-varying, but in many periods the BTC–QQQ co-movement remains stronger than the BTC–GLD co-movement.
+
+Taken together, these findings suggest that, at least during 2020–2024, Bitcoin behaved more like a risk-on asset linked to equity markets than like a traditional safe haven. For investors, this means that adding Bitcoin to a portfolio may not always provide protection when stock markets fall, especially in episodes when both Bitcoin and QQQ sell off at the same time. GLD, in contrast, continues to play a more classic defensive role with lower correlations to both Bitcoin and equities.
+
+There are several limitations. Correlation does not imply causality, and the 2020–2024 period is dominated by unusual events such as the pandemic, very low interest rates and later aggressive tightening. I also ignore transaction costs, intraday behaviour and more complex non-linear relationships. Future work could extend this analysis by using longer histories, higher-frequency data or more advanced models, and by adding other assets such as additional cryptocurrencies, bond ETFs or volatility indices to study portfolio hedging in more detail.
+
+# 6. References
+
+- Data source: Yahoo Finance, historical price data for BTC-USD, QQQ and GLD (accessed via the R package `quantmod`).  
+
+# 7. Session information
+
+```{r}
+# Show the R session information for reproducibility
+sessionInfo()
+```
